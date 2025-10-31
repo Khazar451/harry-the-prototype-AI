@@ -1,0 +1,257 @@
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, filedialog
+import threading, queue, os, json, requests, re
+from transformers import pipeline
+import speech_recognition as sr
+import pyttsx3
+
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".harry_assistant_config.json")
+
+# --- Config ---
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print("Failed to save config:", e)
+
+# --- Web functions ---
+def fetch_wikipedia(query):
+    try:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            return data.get("extract", "No summary available.")
+        return "Wikipedia page not found."
+    except:
+        return "Unable to fetch Wikipedia data."
+
+def fetch_weather(city):
+    try:
+        url = f"https://wttr.in/{city}?format=3"
+        res = requests.get(url, timeout=5)
+        return res.text.strip()
+    except:
+        return "Unable to fetch weather data."
+
+def web_search(query):
+    try:
+        url = f"https://duckduckgo.com/html/?q={query}"
+        html = requests.get(url, timeout=5).text
+        results = re.findall(r'<a[^>]+class="result__a"[^>]*>(.*?)</a>', html)
+        text = " ".join(re.sub(r"<.*?>", "", r) for r in results)
+        return text[:1500] if text else "No results found."
+    except:
+        return "Unable to fetch web data."
+
+# --- Harry App ---
+class HarryApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("Harry — Prototype AI Assistant")
+        root.geometry("800x600")
+        root.minsize(600, 400)
+
+        # Menu
+        menubar = tk.Menu(root)
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="Export Conversation...", command=self.export_conversation)
+        filemenu.add_separator()
+        filemenu.add_command(label="Exit", command=root.quit)
+        menubar.add_cascade(label="File", menu=filemenu)
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+        root.config(menu=menubar)
+
+        # Chat area
+        self.chat_area = scrolledtext.ScrolledText(root, state='disabled', wrap='word', font=("Segoe UI", 11))
+        self.chat_area.pack(fill='both', expand=True, padx=8, pady=(8,0))
+
+        frm = tk.Frame(root)
+        frm.pack(fill='x', padx=8, pady=8)
+        self.entry = tk.Text(frm, height=4, wrap='word', font=("Segoe UI", 11))
+        self.entry.pack(side='left', fill='x', expand=True, padx=(0,8))
+        send_btn = tk.Button(frm, text="Send", width=12, command=self.on_send)
+        send_btn.pack(side='right')
+        voice_btn = tk.Button(frm, text="🎤 Speak", width=12, command=self.voice_input)
+        voice_btn.pack(side='right', padx=(5,0))
+
+        self.status_var = tk.StringVar(value="Loading model...")
+        status = tk.Label(root, textvariable=self.status_var, anchor='w')
+        status.pack(fill='x', side='bottom')
+
+        # Load model
+        try:
+            self.hf_pipe = pipeline("text2text-generation", model="google/flan-t5-large")
+            self.status_var.set("Ready")
+        except Exception as e:
+            messagebox.showerror("Error", f"Model failed to load:\n{e}\nTry:\n> pip install transformers torch sentencepiece requests pyttsx3 speechrecognition")
+            self.hf_pipe = None
+            self.status_var.set("Model not loaded")
+
+        self.q = queue.Queue()
+        self.root.after(100, self.process_queue)
+        self.conversation = []
+
+        # TTS engine
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 160)
+
+    # --- GUI Functions ---
+    def show_about(self):
+        messagebox.showinfo("About Harry",
+            "Harry — Ultimate AI Assistant\n\n"
+            "• Hugging Face FLAN-T5-Large\n"
+            "• Voice input/output\n"
+            "• Live Wikipedia, Web, Weather\n"
+            "• Calculator & Tools\n"
+            "• Memory and context-aware replies"
+        )
+
+    def export_conversation(self):
+        if not self.conversation:
+            messagebox.showinfo("Export", "No conversation to export.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files","*.txt")])
+        if not path: return
+        try:
+            with open(path,"w",encoding="utf-8") as f:
+                for role,text in self.conversation:
+                    f.write(f"{role.upper()}:\n{text}\n\n")
+            messagebox.showinfo("Saved", f"Conversation saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def append_chat(self, role, text):
+        self.chat_area.configure(state='normal')
+        tag = 'user' if role=='user' else 'assistant'
+        prefix = "You: " if role=='user' else "Harry: "
+        self.chat_area.insert('end', prefix, (tag,))
+        self.chat_area.insert('end', text + "\n\n")
+        self.chat_area.tag_config('user', foreground='#0b5394', font=("Segoe UI",10,'bold'))
+        self.chat_area.tag_config('assistant', foreground='#2e7d32', font=("Segoe UI",10,'bold'))
+        self.chat_area.see('end')
+        self.chat_area.configure(state='disabled')
+
+    # --- Input ---
+    def on_send(self):
+        text = self.entry.get("1.0",'end').strip()
+        if not text: return
+        self.entry.delete("1.0",'end')
+        self.append_chat('user', text)
+        self.conversation.append(('user',text))
+        threading.Thread(target=self.get_response, args=(text,), daemon=True).start()
+        self.status_var.set("Thinking...")
+
+    def voice_input(self):
+        threading.Thread(target=self._voice_input_thread, daemon=True).start()
+
+    def _voice_input_thread(self):
+        r = sr.Recognizer()
+        with sr.Microphone() as source:
+            self.status_var.set("Listening...")
+            try:
+                audio = r.listen(source, timeout=5, phrase_time_limit=8)
+                text = r.recognize_google(audio)
+                self.entry.insert('end', text)
+                self.on_send()
+            except Exception as e:
+                self.status_var.set(f"Error: {e}")
+
+    # --- AI Response ---
+    def get_response(self, user_input):
+        try:
+            # Memory context
+            MAX_CONTEXT = 4
+            context_text = ""
+            for role,text in self.conversation[-MAX_CONTEXT*2:]:
+                prefix = "User: " if role=="user" else "Harry: "
+                context_text += prefix + text + "\n"
+
+            # Tool commands
+            if user_input.lower().startswith("/calc "):
+                expr = user_input[6:]
+                try: answer = str(eval(expr))
+                except: answer = "Invalid expression."
+                self.conversation.append(('assistant',answer))
+                self.q.put(('assistant',answer))
+                self.engine.say(answer)
+                self.engine.runAndWait()
+                self.q.put(('status','Ready'))
+                return
+
+            # Web/Wiki/Weather
+            context=""
+            if user_input.lower().startswith("/wiki "):
+                topic = user_input[6:]
+                context = fetch_wikipedia(topic)
+                user_input = f"Summarize this: {context}"
+            elif user_input.lower().startswith("/weather "):
+                city = user_input[9:]
+                context = fetch_weather(city)
+                user_input = f"Explain this weather report: {context}"
+            elif user_input.lower().startswith("/web "):
+                query = user_input[5:]
+                context = web_search(query)
+                user_input = f"Summarize this info about '{query}': {context}"
+
+            # Compose prompt
+            prompt = f"""
+You are Harry, a super-intelligent AI assistant.
+- Be concise, informative, and reasoning-focused.
+- Include examples if helpful.
+Conversation so far:
+{context_text}
+User: {user_input}
+Answer:
+"""
+            if self.hf_pipe:
+                result = self.hf_pipe(prompt, max_new_tokens=300)
+                assistant_text = result[0].get('generated_text','').strip()
+            else:
+                assistant_text = f"(Echo Mode) {user_input[::-1][:200]}"
+
+            if context:
+                assistant_text += f"\n\n(Source summary from live data)"
+
+            self.conversation.append(('assistant',assistant_text))
+            self.q.put(('assistant',assistant_text))
+            self.engine.say(assistant_text)
+            self.engine.runAndWait()
+
+        except Exception as e:
+            self.q.put(('assistant',f"Error: {e}"))
+        finally:
+            self.q.put(('status','Ready'))
+
+    def process_queue(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if item[0]=='assistant':
+                    self.append_chat('assistant', item[1])
+                elif item[0]=='status':
+                    self.status_var.set(item[1])
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_queue)
+
+# --- Main ---
+def main():
+    root = tk.Tk()
+    app = HarryApp(root)
+    root.mainloop()
+
+if __name__=='__main__':
+    main()
