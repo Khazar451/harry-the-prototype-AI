@@ -1,257 +1,155 @@
-import tkinter as tk
-from tkinter import scrolledtext, messagebox, filedialog
-import threading, queue, os, json, requests, re
+import customtkinter as ctk
+from tkinter import scrolledtext
+import threading, queue
 from transformers import pipeline
-import speech_recognition as sr
-import pyttsx3
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".harry_assistant_config.json")
+# --- Global Style Configuration ---
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
 
-# --- Config ---
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+class HarryGPT(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Harry AI — Advanced GPT Assistant")
+        self.geometry("1100x850")
 
-def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as e:
-        print("Failed to save config:", e)
+        # Grid Layout
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-# --- Web functions ---
-def fetch_wikipedia(query):
-    try:
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            return data.get("extract", "No summary available.")
-        return "Wikipedia page not found."
-    except:
-        return "Unable to fetch Wikipedia data."
+        # --- Sidebar ---
+        self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        
+        self.logo = ctk.CTkLabel(self.sidebar, text="HARRY GPT", font=ctk.CTkFont(size=24, weight="bold"))
+        self.logo.pack(pady=30)
+        
+        self.new_chat_btn = ctk.CTkButton(self.sidebar, text="New Session", command=self.clear_chat)
+        self.new_chat_btn.pack(pady=10, padx=20)
 
-def fetch_weather(city):
-    try:
-        url = f"https://wttr.in/{city}?format=3"
-        res = requests.get(url, timeout=5)
-        return res.text.strip()
-    except:
-        return "Unable to fetch weather data."
+        self.status_var = ctk.StringVar(value="Status: Initializing Core...")
+        self.status_lbl = ctk.CTkLabel(self.sidebar, textvariable=self.status_var, font=("Inter", 11))
+        self.status_lbl.pack(side="bottom", pady=20)
 
-def web_search(query):
-    try:
-        url = f"https://duckduckgo.com/html/?q={query}"
-        html = requests.get(url, timeout=5).text
-        results = re.findall(r'<a[^>]+class="result__a"[^>]*>(.*?)</a>', html)
-        text = " ".join(re.sub(r"<.*?>", "", r) for r in results)
-        return text[:1500] if text else "No results found."
-    except:
-        return "Unable to fetch web data."
+        # --- Chat Interface ---
+        self.chat_display = scrolledtext.ScrolledText(self, state='disabled', wrap='word', 
+                                                     bg="#1a1a1a", fg="#ececf1", font=("Inter", 12),
+                                                     padx=25, pady=25, borderwidth=0)
+        self.chat_display.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
 
-# --- Harry App ---
-class HarryApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("Harry — Prototype AI Assistant")
-        root.geometry("800x600")
-        root.minsize(600, 400)
+        # --- Input Console ---
+        self.input_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.input_frame.grid(row=1, column=1, padx=20, pady=(0, 20), sticky="ew")
+        
+        self.entry = ctk.CTkTextbox(self.input_frame, height=100, font=("Inter", 12), corner_radius=15)
+        self.entry.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        
+        self.send_btn = ctk.CTkButton(self.input_frame, text="Execute", width=120, height=45, 
+                                     command=self.on_send, corner_radius=8)
+        self.send_btn.pack(side='right')
 
-        # Menu
-        menubar = tk.Menu(root)
-        filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Export Conversation...", command=self.export_conversation)
-        filemenu.add_separator()
-        filemenu.add_command(label="Exit", command=root.quit)
-        menubar.add_cascade(label="File", menu=filemenu)
-        helpmenu = tk.Menu(menubar, tearoff=0)
-        helpmenu.add_command(label="About", command=self.show_about)
-        menubar.add_cascade(label="Help", menu=helpmenu)
-        root.config(menu=menubar)
-
-        # Chat area
-        self.chat_area = scrolledtext.ScrolledText(root, state='disabled', wrap='word', font=("Segoe UI", 11))
-        self.chat_area.pack(fill='both', expand=True, padx=8, pady=(8,0))
-
-        frm = tk.Frame(root)
-        frm.pack(fill='x', padx=8, pady=8)
-        self.entry = tk.Text(frm, height=4, wrap='word', font=("Segoe UI", 11))
-        self.entry.pack(side='left', fill='x', expand=True, padx=(0,8))
-        send_btn = tk.Button(frm, text="Send", width=12, command=self.on_send)
-        send_btn.pack(side='right')
-        voice_btn = tk.Button(frm, text="🎤 Speak", width=12, command=self.voice_input)
-        voice_btn.pack(side='right', padx=(5,0))
-
-        self.status_var = tk.StringVar(value="Loading model...")
-        status = tk.Label(root, textvariable=self.status_var, anchor='w')
-        status.pack(fill='x', side='bottom')
-
-        # Load model
-        try:
-            self.hf_pipe = pipeline("text2text-generation", model="google/flan-t5-large")
-            self.status_var.set("Ready")
-        except Exception as e:
-            messagebox.showerror("Error", f"Model failed to load:\n{e}\nTry:\n> pip install transformers torch sentencepiece requests pyttsx3 speechrecognition")
-            self.hf_pipe = None
-            self.status_var.set("Model not loaded")
-
+        # --- AI Brain State ---
+        self.history = []
         self.q = queue.Queue()
-        self.root.after(100, self.process_queue)
-        self.conversation = []
+        self.after(100, self.process_queue)
+        
+        # Load the neural network in the background
+        threading.Thread(target=self.load_engine, daemon=True).start()
 
-        # TTS engine
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', 160)
-
-    # --- GUI Functions ---
-    def show_about(self):
-        messagebox.showinfo("About Harry",
-            "Harry — Ultimate AI Assistant\n\n"
-            "• Hugging Face FLAN-T5-Large\n"
-            "• Voice input/output\n"
-            "• Live Wikipedia, Web, Weather\n"
-            "• Calculator & Tools\n"
-            "• Memory and context-aware replies"
-        )
-
-    def export_conversation(self):
-        if not self.conversation:
-            messagebox.showinfo("Export", "No conversation to export.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files","*.txt")])
-        if not path: return
+    def load_engine(self):
         try:
-            with open(path,"w",encoding="utf-8") as f:
-                for role,text in self.conversation:
-                    f.write(f"{role.upper()}:\n{text}\n\n")
-            messagebox.showinfo("Saved", f"Conversation saved to {path}")
+            # FLAN-T5-Large is selected for its instruction-following capabilities
+            self.model = pipeline("text2text-generation", model="google/flan-t5-large")
+            self.status_var.set("Status: Core Online")
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            self.status_var.set("Status: Load Error")
+            print(f"Neural Error: {e}")
 
-    def append_chat(self, role, text):
-        self.chat_area.configure(state='normal')
-        tag = 'user' if role=='user' else 'assistant'
-        prefix = "You: " if role=='user' else "Harry: "
-        self.chat_area.insert('end', prefix, (tag,))
-        self.chat_area.insert('end', text + "\n\n")
-        self.chat_area.tag_config('user', foreground='#0b5394', font=("Segoe UI",10,'bold'))
-        self.chat_area.tag_config('assistant', foreground='#2e7d32', font=("Segoe UI",10,'bold'))
-        self.chat_area.see('end')
-        self.chat_area.configure(state='disabled')
-
-    # --- Input ---
     def on_send(self):
-        text = self.entry.get("1.0",'end').strip()
-        if not text: return
-        self.entry.delete("1.0",'end')
-        self.append_chat('user', text)
-        self.conversation.append(('user',text))
-        threading.Thread(target=self.get_response, args=(text,), daemon=True).start()
-        self.status_var.set("Thinking...")
+        user_input = self.entry.get("1.0", "end").strip()
+        if not user_input: return
+        
+        self.entry.delete("1.0", "end")
+        self.update_display("USER", user_input)
+        
+        self.status_var.set("Harry is thinking...")
+        threading.Thread(target=self.think, args=(user_input,), daemon=True).start()
 
-    def voice_input(self):
-        threading.Thread(target=self._voice_input_thread, daemon=True).start()
+    def think(self, user_input):
+        # 1. Identity Anchor: Defined by interests in engineering and strategy games
+        system_identity = (
+            "You are Harry, a witty and brilliant Computer Engineering AI assistant. "
+            "You are highly articulate, technical, and never repeat the user's input. "
+            "You specialize in Java, Python, and grand strategy games like EU4.\n\n"
+        )
+        
+        # 2. Memory Context: Using a sliding window to keep focus
+        recent_context = self.history[-4:] 
+        conversation_flow = ""
+        for turn in recent_context:
+            conversation_flow += f"{turn['speaker']}: {turn['text']}\n"
+        
+        # 3. Prompt Formatting: Structured to avoid the 'echo' effect
+        final_prompt = f"{system_identity}### Conversation History:\n{conversation_flow}### New Question:\nUSER: {user_input}\nHARRY:"
 
-    def _voice_input_thread(self):
-        r = sr.Recognizer()
-        with sr.Microphone() as source:
-            self.status_var.set("Listening...")
-            try:
-                audio = r.listen(source, timeout=5, phrase_time_limit=8)
-                text = r.recognize_google(audio)
-                self.entry.insert('end', text)
-                self.on_send()
-            except Exception as e:
-                self.status_var.set(f"Error: {e}")
-
-    # --- AI Response ---
-    def get_response(self, user_input):
+        # 4. GPT-Style Decoding Parameters
+        # Repetition penalty is set high to force original generation
+        # Temperature and Top-P allow for creative, diverse responses
         try:
-            # Memory context
-            MAX_CONTEXT = 4
-            context_text = ""
-            for role,text in self.conversation[-MAX_CONTEXT*2:]:
-                prefix = "User: " if role=="user" else "Harry: "
-                context_text += prefix + text + "\n"
+            result = self.model(
+                final_prompt,
+                max_new_tokens=300,
+                do_sample=True,
+                temperature=0.85,
+                top_p=0.92,
+                repetition_penalty=3.5 
+            )
+            response = result[0]['generated_text'].strip()
+            
+            # Post-Generation Cleanup
+            for tag in ["HARRY:", "Harry:", "Assistant:", "USER:"]:
+                response = response.replace(tag, "")
+            response = response.strip()
+        except:
+            response = "Error: Neural inference failed. Please re-run the kernel."
 
-            # Tool commands
-            if user_input.lower().startswith("/calc "):
-                expr = user_input[6:]
-                try: answer = str(eval(expr))
-                except: answer = "Invalid expression."
-                self.conversation.append(('assistant',answer))
-                self.q.put(('assistant',answer))
-                self.engine.say(answer)
-                self.engine.runAndWait()
-                self.q.put(('status','Ready'))
-                return
+        self.q.put(response)
+        self.history.append({"speaker": "USER", "text": user_input})
+        self.history.append({"speaker": "HARRY", "text": response})
 
-            # Web/Wiki/Weather
-            context=""
-            if user_input.lower().startswith("/wiki "):
-                topic = user_input[6:]
-                context = fetch_wikipedia(topic)
-                user_input = f"Summarize this: {context}"
-            elif user_input.lower().startswith("/weather "):
-                city = user_input[9:]
-                context = fetch_weather(city)
-                user_input = f"Explain this weather report: {context}"
-            elif user_input.lower().startswith("/web "):
-                query = user_input[5:]
-                context = web_search(query)
-                user_input = f"Summarize this info about '{query}': {context}"
-
-            # Compose prompt
-            prompt = f"""
-You are Harry, a super-intelligent AI assistant.
-- Be concise, informative, and reasoning-focused.
-- Include examples if helpful.
-Conversation so far:
-{context_text}
-User: {user_input}
-Answer:
-"""
-            if self.hf_pipe:
-                result = self.hf_pipe(prompt, max_new_tokens=300)
-                assistant_text = result[0].get('generated_text','').strip()
-            else:
-                assistant_text = f"(Echo Mode) {user_input[::-1][:200]}"
-
-            if context:
-                assistant_text += f"\n\n(Source summary from live data)"
-
-            self.conversation.append(('assistant',assistant_text))
-            self.q.put(('assistant',assistant_text))
-            self.engine.say(assistant_text)
-            self.engine.runAndWait()
-
-        except Exception as e:
-            self.q.put(('assistant',f"Error: {e}"))
-        finally:
-            self.q.put(('status','Ready'))
+    def update_display(self, speaker, text):
+        self.chat_display.configure(state='normal')
+        tag = speaker
+        header = f"{speaker}\n"
+        self.chat_display.insert('end', header, tag)
+        self.chat_display.insert('end', f"{text}\n\n")
+        
+        # Styling for chat bubbles
+        if speaker == "USER":
+            self.chat_display.tag_config(tag, foreground="#10a37f", font=("Inter", 11, "bold"))
+        else:
+            self.chat_display.tag_config(tag, foreground="#5dade2", font=("Inter", 11, "bold"))
+            
+        self.chat_display.see('end')
+        self.chat_display.configure(state='disabled')
 
     def process_queue(self):
         try:
             while True:
-                item = self.q.get_nowait()
-                if item[0]=='assistant':
-                    self.append_chat('assistant', item[1])
-                elif item[0]=='status':
-                    self.status_var.set(item[1])
+                response = self.q.get_nowait()
+                self.update_display("HARRY", response)
+                self.status_var.set("Status: Core Online")
         except queue.Empty:
             pass
-        self.root.after(100, self.process_queue)
+        self.after(100, self.process_queue)
 
-# --- Main ---
-def main():
-    root = tk.Tk()
-    app = HarryApp(root)
-    root.mainloop()
+    def clear_chat(self):
+        self.chat_display.configure(state='normal')
+        self.chat_display.delete("1.0", "end")
+        self.chat_display.configure(state='disabled')
+        self.history = []
+        self.status_var.set("Status: Memory Wiped")
 
-if __name__=='__main__':
-    main()
+if __name__ == "__main__":
+    app = HarryGPT()
+    app.mainloop()
