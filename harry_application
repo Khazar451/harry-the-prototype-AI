@@ -1,0 +1,508 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, filedialog
+import threading
+import queue
+import os
+import json
+import requests
+import speech_recognition as sr
+import pyttsx3
+from datetime import datetime
+from google import genai
+from google.genai import types
+
+# ============================================================================
+# CONFIGURATION FUNCTIONS
+# ============================================================================
+
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".harry_assistant_config.json")
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save config: {e}")
+
+# ============================================================================
+# WEB/DATA FUNCTIONS WITH ANNOTATIONS FOR GEMINI TOOL CALLING
+# ============================================================================
+
+def fetch_wikipedia(query: str) -> str:
+    """Fetch Wikipedia summary to extract encyclopedic information about a topic."""
+    try:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            extract = data.get("extract", "No summary available.")
+            return extract[:1000]
+        return "Wikipedia page not found."
+    except Exception as e:
+        return f"Unable to fetch Wikipedia data: {str(e)[:50]}"
+
+def fetch_weather(city: str) -> str:
+    """Fetch current weather information for a specific city."""
+    try:
+        url = f"https://wttr.in/{city}?format=j1"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+        current = data['current_condition'][0]
+        temp = current['temp_C']
+        desc = current['weatherDesc'][0]['value']
+        humidity = current['humidity']
+        wind = current['windspeedKmph']
+        return f"🌡️ Temperature: {temp}°C | Condition: {desc} | Humidity: {humidity}% | Wind: {wind} km/h"
+    except Exception as e:
+        return f"Unable to fetch weather data: {str(e)[:50]}"
+
+def web_search(query: str) -> str:
+    """Fetch web search results from DuckDuckGo for recent news, events, or general queries."""
+    try:
+        url = "https://api.duckduckgo.com/"
+        params = {"q": query, "format": "json", "no_html": 1}
+        res = requests.get(url, params=params, timeout=5)
+        data = res.json()
+        
+        results = []
+        if data.get("RelatedTopics"):
+            for item in data["RelatedTopics"][:5]:
+                if "Text" in item:
+                    results.append(item["Text"])
+        
+        if data.get("AbstractText"):
+            results.insert(0, data["AbstractText"])
+        
+        return " ".join(results)[:2000] if results else "No results found."
+    except Exception as e:
+        return f"Unable to fetch web data: {str(e)[:50]}"
+
+def calculate_math(expr: str) -> str:
+    """Evaluates mathematical expressions safely."""
+    try:
+        safe_dict = {
+            '__builtins__': {},
+            'abs': abs, 'round': round, 'max': max, 'min': min,
+            'sum': sum, 'pow': pow, 'len': len, 'sqrt': lambda x: x ** 0.5
+        }
+        result = eval(expr, safe_dict)
+        return f"Result: {result}"
+    except Exception as e:
+        return f"Invalid expression: {str(e)[:50]}"
+
+# ============================================================================
+# MAIN HARRY APPLICATION (UPGRADED WITH MODERN UI & GEMINI)
+# ============================================================================
+
+class ModernHarryApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        # Configure customtkinter
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        
+        self.title("Harry ✨ — Advanced AI Assistant")
+        self.geometry("1100x850")
+        self.minsize(900, 700)
+        
+        # Colors
+        self.accent_color = "#6366f1" # Indigo Accent
+        self.bg_color = "#0f172a"     # Slate 900
+        self.panel_color = "#1e293b"  # Slate 800
+        self.text_color = "#f8fafc"   # Slate 50
+        
+        self.configure(fg_color=self.bg_color)
+        
+        # Initialize Gemini API
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.client = None
+        self.chat_session = None
+        self.model_name = "gemini-2.5-flash-lite"
+        
+        # Load configuration
+        self.config = load_config()
+        self.temperature = self.config.get("temperature", 0.7)
+        
+        if self.api_key:
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+                config = types.GenerateContentConfig(
+                    system_instruction=self._build_system_prompt(),
+                    tools=[fetch_wikipedia, fetch_weather, web_search, calculate_math],
+                    temperature=self.temperature,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False)
+                )
+                self.chat_session = self.client.chats.create(
+                    model=self.model_name,
+                    config=config
+                )
+            except Exception as e:
+                print(f"Failed to initialize Gemini: {e}")
+        
+        # Initialize TTS
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 150)
+        
+        # Message queue for thread-safe GUI updates
+        self.q = queue.Queue()
+        self.conversation = []
+        
+        # Setup UI
+        self._setup_layout()
+        self._setup_menu()
+        self._setup_chat_area()
+        self._setup_input_area()
+        self._setup_status_bar()
+        
+        # Start queue processor
+        self.after(100, self._process_queue)
+        self._update_status()
+
+    def _build_system_prompt(self):
+        return f'''You are Harry, an advanced AI assistant with exceptional knowledge and reasoning abilities.
+You are powered by Google's state-of-the-art Gemini 2.5 architecture.
+
+Core Characteristics:
+- Highly intelligent, knowledgeable, and intuitive across all domains
+- You possess the ability to use tools properly to fetch real-world data, evaluate math, and search the web
+- Clear, logical, and conversational communication style
+- Use tools intelligently when the user asks for real-time information (news, weather, latest updates) or Wikipedia articles.
+- Do not ask for permission to use tools if it makes sense to answer the prompt. Just use them.
+
+Current Date: {datetime.now().strftime('%Y-%m-%d')}
+Assistant Name: Harry'''
+
+    def _setup_layout(self):
+        """Setup the main grid layout"""
+        self.grid_rowconfigure(0, weight=1)      # Chat area expands
+        self.grid_rowconfigure(1, weight=0)      # Input area fixed
+        self.grid_rowconfigure(2, weight=0)      # Status bar fixed
+        self.grid_columnconfigure(0, weight=1)   # Main area expands
+
+    def _setup_menu(self):
+        menubar = tk.Menu(self, bg=self.panel_color, fg=self.text_color, borderwidth=0)
+        
+        filemenu = tk.Menu(menubar, tearoff=0, bg=self.panel_color, fg=self.text_color)
+        filemenu.add_command(label="Export as Text", command=self._export_as_txt)
+        filemenu.add_command(label="Export as JSON", command=self._export_as_json)
+        filemenu.add_command(label="Clear Conversation", command=self._clear_conversation)
+        filemenu.add_separator()
+        filemenu.add_command(label="Exit", command=self.quit)
+        menubar.add_cascade(label="File", menu=filemenu)
+        
+        settingsmenu = tk.Menu(menubar, tearoff=0, bg=self.panel_color, fg=self.text_color)
+        settingsmenu.add_command(label="API Settings", command=self._show_api_settings)
+        menubar.add_cascade(label="Settings", menu=settingsmenu)
+        
+        helpmenu = tk.Menu(menubar, tearoff=0, bg=self.panel_color, fg=self.text_color)
+        helpmenu.add_command(label="About", command=self._show_about)
+        helpmenu.add_command(label="Setup Guide", command=self._show_setup_guide)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+        
+        # In CustomTkinter, to attach a standard menu, we config the underlying tk Toplevel/root
+        # config is overridden as a property/dict in CTk, so we call the underlying tkinter method directly
+        tk.Tk.config(self, menu=menubar)
+
+    def _setup_chat_area(self):
+        self.chat_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.chat_frame.grid(row=0, column=0, sticky="nsew", padx=30, pady=(30, 15))
+        self.chat_frame.grid_rowconfigure(1, weight=1)
+        self.chat_frame.grid_columnconfigure(0, weight=1)
+        
+        header_label = ctk.CTkLabel(
+            self.chat_frame, 
+            text="✨ Chat with Harry", 
+            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
+            text_color=self.accent_color
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 15))
+
+        # We fall back to standard tk scrolledtext for the chat area because CTkTextbox 
+        # doesn't support complex tag configuring (different colors/fonts per line easily)
+        self.chat_area = scrolledtext.ScrolledText(
+            self.chat_frame, 
+            state='disabled', 
+            wrap='word', 
+            font=("Segoe UI", 12),
+            bg=self.panel_color,
+            fg=self.text_color,
+            relief='flat',
+            padx=20,
+            pady=20,
+            insertbackground=self.text_color
+        )
+        self.chat_area.grid(row=1, column=0, sticky="nsew")
+        
+        # Configure tags
+        self.chat_area.tag_config('user', foreground="#38bdf8", font=("Segoe UI", 12, 'bold'))
+        self.chat_area.tag_config('assistant', foreground="#a78bfa", font=("Segoe UI", 12, 'bold'))
+        self.chat_area.tag_config('system', foreground="#fb7185", font=("Segoe UI", 11, 'italic'))
+        self.chat_area.tag_config('normal', foreground=self.text_color, font=("Segoe UI", 12))
+
+    def _setup_input_area(self):
+        input_frame = ctk.CTkFrame(self, fg_color=self.panel_color, corner_radius=15)
+        input_frame.grid(row=1, column=0, sticky="ew", padx=30, pady=10)
+        input_frame.grid_columnconfigure(0, weight=1)
+        
+        self.entry = ctk.CTkTextbox(
+            input_frame, 
+            height=80,
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            fg_color="transparent",
+            text_color=self.text_color,
+            wrap="word",
+            border_width=0
+        )
+        self.entry.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        self.entry.bind('<Control-Return>', lambda e: (self.on_send(), "break")[1])
+        
+        button_container = ctk.CTkFrame(input_frame, fg_color="transparent")
+        button_container.grid(row=0, column=1, sticky="ns", padx=(0, 15), pady=15)
+        
+        send_btn = ctk.CTkButton(
+            button_container, 
+            text="Send", 
+            image=self._create_send_icon(),
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            fg_color=self.accent_color,
+            hover_color="#4f46e5",
+            width=100,
+            height=35,
+            command=self.on_send
+        )
+        send_btn.pack(side="top", pady=(0, 10))
+        
+        voice_btn = ctk.CTkButton(
+            button_container, 
+            text="Voice", 
+            image=self._create_mic_icon(),
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=100,
+            height=35,
+            command=self.voice_input
+        )
+        voice_btn.pack(side="top")
+
+    def _setup_status_bar(self):
+        self.status_frame = ctk.CTkFrame(self, fg_color=self.panel_color, height=35, corner_radius=0)
+        self.status_frame.grid(row=2, column=0, sticky="ew")
+        self.status_frame.grid_propagate(False)
+        
+        self.status_label = ctk.CTkLabel(
+            self.status_frame, 
+            text="Initializing...", 
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color="#94a3b8"
+        )
+        self.status_label.pack(side="left", padx=20, pady=5)
+
+    def _create_send_icon(self):
+        # Placeholder for CTkImage if actual icon is present
+        # Currently just returns None so text aligns well natively
+        return None
+        
+    def _create_mic_icon(self):
+        return None
+
+    def _set_status(self, text, is_error=False):
+        self.status_label.configure(text=text, text_color="#ef4444" if is_error else "#94a3b8")
+
+    def _update_status(self):
+        if not self.chat_session:
+            self._set_status("⚠️ API Key Missing - Set GEMINI_API_KEY environment variable", True)
+        else:
+            self._set_status(f"✓ Connected | Engine: {self.model_name} ✨ | Native Tools: Active")
+
+    def _append_chat(self, role, text):
+        self.chat_area.configure(state='normal')
+        
+        if role == 'user':
+            prefix = "You:\n"
+            tag = 'user'
+        elif role == 'system':
+            prefix = "System:\n"
+            tag = 'system'
+        else:
+            prefix = "Harry ✨:\n"
+            tag = 'assistant'
+        
+        self.chat_area.insert('end', prefix, (tag,))
+        self.chat_area.insert('end', text + "\n\n", ('normal',))
+        self.chat_area.see('end')
+        self.chat_area.configure(state='disabled')
+
+    def _clear_conversation(self):
+        if messagebox.askyesno("Clear", "Clear all memory?"):
+            self.conversation = []
+            if self.client:
+                config = types.GenerateContentConfig(
+                    system_instruction=self._build_system_prompt(),
+                    tools=[fetch_wikipedia, fetch_weather, web_search, calculate_math],
+                    temperature=self.temperature,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False)
+                )
+                self.chat_session = self.client.chats.create(
+                    model=self.model_name,
+                    config=config
+                )
+            self.chat_area.configure(state='normal')
+            self.chat_area.delete('1.0', 'end')
+            self.chat_area.configure(state='disabled')
+            self._append_chat('system', "Memory wiped. Ready for new interactions.")
+
+    def _export_as_txt(self):
+        if not self.conversation: return
+        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
+        if not path: return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"Harry AI - Conversation Export (Powered by {self.model_name})\n")
+                f.write(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 70 + "\n\n")
+                for role, text in self.conversation:
+                    f.write(f"{role.upper()}:\n{text}\n\n")
+            messagebox.showinfo("Success", f"Exported to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export: {str(e)}")
+
+    def _export_as_json(self):
+        if not self.conversation: return
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        if not path: return
+        try:
+            data = {
+                "timestamp": datetime.now().isoformat(),
+                "model": self.model_name,
+                "conversation": [{"role": role, "content": text} for role, text in self.conversation]
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            messagebox.showinfo("Success", f"Exported to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export: {str(e)}")
+
+    def _show_about(self):
+        messagebox.showinfo("About Harry",
+            "Harry ✨ — Advanced AI Assistant\n"
+            f"Upgraded with Google {self.model_name}\n\n"
+            "Smarter Features:\n"
+            "• Built entirely on Modern CustomTkinter\n"
+            "• Native Automatic Tool Calling built-in\n"
+            "• Fast, responsive reasoning")
+
+    def _show_setup_guide(self):
+        setup_text = (
+            "Harry Advanced Setup Guide\n\n"
+            "1. GET YOUR GEMINI API KEY:\n"
+            "   • Visit: https://aistudio.google.com/app/apikey\n"
+            "2. SET ENVIRONMENT VARIABLE:\n"
+            "   Windows CMD: setx GEMINI_API_KEY \"your-key\"\n"
+            "3. INSTALL GOOGLE SDK & GUI:\n"
+            "   pip install google-genai customtkinter\n"
+        )
+        messagebox.showinfo("Setup Guide", setup_text)
+
+    def _show_api_settings(self):
+        status = f"✓ Connected ({self.model_name})" if self.chat_session else "✗ Not Configured"
+        key_display = self.api_key[:15] + "..." if self.api_key else "Not Set"
+        messagebox.showinfo("API Settings", f"Gemini API Status: {status}\nAPI Key: {key_display}")
+
+    def on_send(self):
+        text = self.entry.get("1.0", 'end').strip()
+        if not text:
+            return "break"
+        
+        if not self.chat_session:
+            messagebox.showerror("Error", "Gemini API key not configured.\n\nSet GEMINI_API_KEY environment variable.")
+            return "break"
+        
+        self.entry.delete("1.0", 'end')
+        self._append_chat('user', text)
+        self.conversation.append(('user', text))
+        self._set_status("🧠 Thinking deeply...")
+        self.update()
+        
+        threading.Thread(target=self._get_response, args=(text,), daemon=True).start()
+        return "break"
+
+    def voice_input(self):
+        threading.Thread(target=self._voice_input_thread, daemon=True).start()
+
+    def _voice_input_thread(self):
+        r = sr.Recognizer()
+        try:
+            self.q.put(('status', "🎤 Listening... (5 seconds)", False))
+            with sr.Microphone() as source:
+                audio = r.listen(source, timeout=5, phrase_time_limit=8)
+            self.q.put(('status', "🔄 Synthesizing speech...", False))
+            text = r.recognize_google(audio)
+            self.entry.insert('end', text)
+            self.after(100, self.on_send)
+        except sr.UnknownValueError:
+            self.q.put(('status', "Could not understand audio", True))
+            self.after(2000, self._update_status)
+        except sr.RequestError as e:
+            self.q.put(('status', "Speech recognition unavailable", True))
+            self.after(2000, self._update_status)
+        except Exception as e:
+            self.q.put(('status', f"Error: {str(e)[:40]}", True))
+            self.after(2000, self._update_status)
+
+    def _get_response(self, user_input):
+        try:
+            response = self.chat_session.send_message(user_input)
+            assistant_text = response.text
+            self.conversation.append(('assistant', assistant_text))
+            self.q.put(('assistant', assistant_text))
+
+            try:
+                tts_text = assistant_text[:200]
+                self.engine.say(tts_text)
+                self.engine.runAndWait()
+            except:
+                pass
+
+        except Exception as e:
+            error_msg = f"❌ Error: {str(e)}"
+            self.conversation.append(('assistant', error_msg))
+            self.q.put(('assistant', error_msg))
+        finally:
+            self.q.put(('status', "Ready", False))
+
+    def _process_queue(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if item[0] == 'assistant':
+                    self._append_chat('assistant', item[1])
+                    self._update_status()
+                elif item[0] == 'status':
+                    is_error = len(item) > 2 and item[2]
+                    self._set_status(item[1], is_error)
+        except queue.Empty:
+            pass
+        self.after(100, self._process_queue)
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    app = ModernHarryApp()
+    app.mainloop()
+
+if __name__=='__main__':
+    main()
